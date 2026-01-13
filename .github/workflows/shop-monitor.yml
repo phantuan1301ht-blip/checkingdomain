@@ -13,7 +13,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -40,15 +40,7 @@ jobs:
       - name: Ensure state.json exists
         run: |
           if [ ! -f state.json ]; then echo "{}" > state.json; fi
-          echo "state.json exists"
-
-      - name: Debug domains.txt
-        run: |
-          echo "PWD=$(pwd)"
-          ls -la
-          echo "---- domains.txt (first 50 lines) ----"
-          sed -n '1,50p' domains.txt || true
-          echo "--------------------------------------"
+          echo "state.json OK"
 
       - name: Decide mode (report at 01:00 UTC = 08:00 VN)
         id: mode
@@ -71,7 +63,10 @@ jobs:
           FAIL_THRESHOLD: "3"
           CONCURRENCY: "30"
           BATCH_SIZE: "250"
-          MAX_REPORT_ITEMS: "120"
+          MAX_REPORT_ITEMS: "150"
+          LOG_SAMPLE_LIMIT: "60"
+          # ✅ Manual run will send Telegram immediately for testing
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
