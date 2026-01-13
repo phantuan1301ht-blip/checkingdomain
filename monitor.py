@@ -9,59 +9,82 @@ STATE_FILE   = os.getenv("STATE_FILE", "state.json")
 MODE = os.getenv("MODE", "check").strip().lower()  # "check" or "report"
 CHECK_PATH = os.getenv("CHECK_PATH", "/")
 TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "12000"))
-FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))  # fail N lần liên tiếp mới tính "down"
-MAX_REPORT_ITEMS = int(os.getenv("MAX_REPORT_ITEMS", "60"))
+FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))  # fail N lần liên tiếp mới tính down
+MAX_REPORT_ITEMS = int(os.getenv("MAX_REPORT_ITEMS", "80"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# Keywords to detect "soft down" even when HTTP 200
 FAIL_KEYWORDS = [
-    # Shopify-ish
+    # Shopify
     "sorry, this shop is currently unavailable",
     "this store is unavailable",
     "shop is unavailable",
     "domain not configured",
     "enter using password",
+    "password",
     # Wix / generic
     "site not found",
     "this domain is parked",
     "bad gateway",
     "service unavailable",
     "gateway time-out",
+    "error 502",
+    "error 503",
+    "error 504",
 ]
 
 def now_iso():
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    # Local time on runner is UTC; message label can be adjusted if you want
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 def normalize_url(line: str) -> str:
     s = line.strip()
     if not s:
         return ""
+    # allow comments
+    if s.startswith("#"):
+        return ""
     if not s.startswith("http://") and not s.startswith("https://"):
         s = "https://" + s
     u = urlparse(s)
+    if not u.netloc:
+        return ""
     return f"{u.scheme}://{u.netloc}{CHECK_PATH}"
 
 def read_domains():
     if not os.path.exists(DOMAINS_FILE):
-        print(f"Missing {DOMAINS_FILE}")
-        sys.exit(1)
+        raise FileNotFoundError(f"Missing {DOMAINS_FILE}. Current dir={os.getcwd()}")
+
     out = []
-    with open(DOMAINS_FILE, "r", encoding="utf-8") as f:
+    # utf-8-sig handles BOM (Windows)
+    with open(DOMAINS_FILE, "r", encoding="utf-8-sig") as f:
         for line in f:
             url = normalize_url(line)
             if url:
                 out.append(url)
-    return out
+
+    if not out:
+        raise ValueError(f"{DOMAINS_FILE} is empty or has no valid domains.")
+
+    # de-duplicate, keep order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
 
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        try:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or {}
-        except Exception:
-            return {}
+    except Exception:
+        return {}
 
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -91,7 +114,7 @@ def looks_down(html: str):
 def check_all(domains, state):
     """
     state[url] = {
-      fail_count, last_status, last_reason, last_checked, last_ok
+      fail_count, last_status, last_reason, last_checked, last_ok, final_url
     }
     """
     results = []
@@ -99,7 +122,7 @@ def check_all(domains, state):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        # new_context() == incognito session (không lưu cookie/storage)
+        # new_context() == incognito (no persisted cookies/storage)
         context = browser.new_context(ignore_https_errors=True)
 
         for url in domains:
@@ -115,17 +138,17 @@ def check_all(domains, state):
                 status = resp.status if resp else None
 
                 html = page.content()
-                kw_reason = looks_down(html)
-                if kw_reason:
-                    reason = kw_reason
+                soft = looks_down(html)
 
-                # hard fail by status
+                # Hard fail by HTTP status
                 if status is None:
-                    reason = reason or "NO_RESPONSE"
+                    reason = "NO_RESPONSE"
                 elif status >= 500:
-                    reason = reason or f"HTTP_{status}"
+                    reason = f"HTTP_{status}"
                 elif status == 404:
-                    reason = reason or "HTTP_404"
+                    reason = "HTTP_404"
+                elif soft:
+                    reason = soft
 
                 ok = (reason is None)
 
@@ -186,7 +209,7 @@ def report_and_reset(state):
             up_count += 1
 
     msg = []
-    msg.append(f"🧾 Night Monitor Summary (VN): {now_iso()}")
+    msg.append(f"🧾 Night Monitor Summary (UTC): {now_iso()}")
     msg.append(f"✅ UP: {up_count} | ❌ DOWN: {len(down_list)} | Total: {total}")
     msg.append(f"Rule: DOWN if fail_count ≥ {FAIL_THRESHOLD}")
 
@@ -203,10 +226,10 @@ def report_and_reset(state):
     text = "\n".join(msg)
     print(text)
 
-    # gửi telegram (gửi cả khi 0 down cũng được; bạn muốn chỉ gửi khi có down thì đổi if)
+    # Always send summary at 08:00 VN (01:00 UTC)
     send_telegram(text)
 
-    # reset state cho đêm sau
+    # reset state for next night window
     return {}
 
 def main():
@@ -216,7 +239,6 @@ def main():
         results, state = check_all(domains, state)
         save_state(state)
 
-        # log nhẹ
         downs = [r for r in results if not r[1]]
         print(f"[CHECK] {now_iso()} | checked={len(results)} | down_now={len(downs)} | state_saved")
 
@@ -227,8 +249,7 @@ def main():
         print("[REPORT] sent + state reset")
 
     else:
-        print("MODE must be check or report")
-        sys.exit(1)
+        raise ValueError("MODE must be check or report")
 
 if __name__ == "__main__":
     main()
