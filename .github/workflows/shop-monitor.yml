@@ -1,0 +1,67 @@
+name: Night Shop Monitor (VN 21:00-08:00)
+
+on:
+  schedule:
+    # 21:00-06:00 VN tương ứng 14:00-23:00 UTC (mỗi giờ)
+    - cron: "0 14-23 * * *"
+    # 07:00-08:00 VN tương ứng 00:00-01:00 UTC (mỗi giờ)
+    - cron: "0 0-1 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Decide mode (report at 01:00 UTC = 08:00 VN)
+        id: mode
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" = "01" ]; then
+            echo "MODE=report" >> $GITHUB_OUTPUT
+          else
+            echo "MODE=check" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run monitor
+        env:
+          MODE: ${{ steps.mode.outputs.MODE }}
+          DOMAINS_FILE: domains.txt
+          STATE_FILE: state.json
+          CHECK_PATH: /
+          TIMEOUT_MS: "12000"
+          FAIL_THRESHOLD: "3"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python monitor.py
+
+      - name: Commit updated state.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update monitor state"
+          git push
