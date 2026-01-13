@@ -1,81 +1,12 @@
-name: Night Shop Monitor (VN 21:00-08:00)
-
-on:
-  schedule:
-    - cron: "0 14-23 * * *"  # 21:00-06:00 VN (UTC 14-23)
-    - cron: "0 0-1 * * *"    # 07:00-08:00 VN (UTC 00-01)
-  workflow_dispatch: {}
-
-concurrency:
-  group: shop-monitor
-  cancel-in-progress: false
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      # Cache state.json to persist fail_count across hourly runs
-      - name: Restore state cache
-        id: cache_state
-        uses: actions/cache@v4
-        with:
-          path: state.json
-          key: shop-monitor-state-v1
-          restore-keys: shop-monitor-state-v1
-
-      - name: Ensure state.json exists
-        run: |
-          if [ ! -f state.json ]; then echo "{}" > state.json; fi
-          echo "state.json:"
-          head -n 20 state.json || true
-
-      - name: Debug domains.txt
-        run: |
-          echo "PWD=$(pwd)"
-          ls -la
-          echo "---- domains.txt (first 80 lines) ----"
-          sed -n '1,80p' domains.txt || true
-          echo "--------------------------------------"
-
-      - name: Decide mode (report at 01:00 UTC = 08:00 VN)
-        id: mode
-        run: |
-          HOUR=$(date -u +%H)
-          if [ "$HOUR" = "01" ]; then
-            echo "MODE=report" >> $GITHUB_OUTPUT
-          else
-            echo "MODE=check" >> $GITHUB_OUTPUT
-          fi
-          echo "UTC hour=$HOUR, MODE=${{ steps.mode.outputs.MODE }}"
-
-      - name: Run monitor
-        env:
-          MODE: ${{ steps.mode.outputs.MODE }}
-          DOMAINS_FILE: domains.txt
-          STATE_FILE: state.json
-          CHECK_PATH: /
-          TIMEOUT_MS: "12000"
-          FAIL_THRESHOLD: "3"
-          MAX_REPORT_ITEMS: "80"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python monitor.py
-
-      # NOTE: No git commit/push. Cache will be saved automatically when state.json changes.
+env:
+  MODE: ${{ steps.mode.outputs.MODE }}
+  DOMAINS_FILE: domains.txt
+  STATE_FILE: state.json
+  CHECK_PATH: /
+  TIMEOUT_MS: "8000"
+  FAIL_THRESHOLD: "3"
+  CONCURRENCY: "30"
+  BATCH_SIZE: "250"
+  MAX_REPORT_ITEMS: "120"
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
