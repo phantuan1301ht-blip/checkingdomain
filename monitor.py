@@ -1,4 +1,4 @@
-import os, json, time, asyncio
+import os, json, time, asyncio, re
 import requests
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
@@ -9,14 +9,17 @@ STATE_FILE   = os.getenv("STATE_FILE", "state.json")
 MODE = os.getenv("MODE", "check").strip().lower()  # check | report
 CHECK_PATH = os.getenv("CHECK_PATH", "/")
 
-TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "8000"))
+# ✅ Timeout 30s (set from workflow TIMEOUT_MS="30000")
+TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "30000"))
+
 FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))
-MAX_REPORT_ITEMS = int(os.getenv("MAX_REPORT_ITEMS", "150"))
+MAX_REPORT_ITEMS = int(os.getenv("MAX_REPORT_ITEMS", "200"))
 
 CONCURRENCY = int(os.getenv("CONCURRENCY", "30"))
 BATCH_SIZE  = int(os.getenv("BATCH_SIZE", "250"))
 
-LOG_SAMPLE_LIMIT = int(os.getenv("LOG_SAMPLE_LIMIT", "60"))
+# For Actions logs
+LOG_SAMPLE_LIMIT = int(os.getenv("LOG_SAMPLE_LIMIT", "40"))
 
 # ✅ Manual run test => send telegram immediately after check
 FORCE_SEND = os.getenv("FORCE_SEND", "0").strip() == "1"
@@ -70,7 +73,6 @@ def read_domains():
     if not out:
         raise ValueError(f"{DOMAINS_FILE} is empty or has no valid domains.")
 
-    # de-dupe keep order
     seen = set()
     uniq = []
     for x in out:
@@ -121,10 +123,42 @@ def classify_state(st: dict) -> str:
         return "DOWN"
     return "FAIL_TMP"
 
+def short_reason(reason: str | None) -> str:
+    if not reason:
+        return ""
+    # Remove extremely long playwright call log noise if any
+    reason = reason.replace("\n", " ").strip()
+    reason = re.sub(r"\s+", " ", reason)
+    # Keep it short
+    if len(reason) > 90:
+        reason = reason[:87] + "..."
+    return reason
+
+def reason_group(reason: str | None, status: int | None) -> str:
+    """
+    Group for nicer reporting.
+    """
+    if reason is None:
+        return "OK"
+    if reason.startswith("HTTP_404"):
+        return "HTTP 404"
+    if reason.startswith("HTTP_5") or (status and status >= 500):
+        return "HTTP 5xx"
+    if reason == "TIMEOUT":
+        return "TIMEOUT (30s)"
+    if "ERR_NAME_NOT_RESOLVED" in reason:
+        return "DNS / DOMAIN NOT FOUND"
+    if "ERR_CONNECTION_REFUSED" in reason or "ERR_CONNECTION_RESET" in reason:
+        return "CONNECTION ERROR"
+    if "KEYWORD:enter using password" in reason:
+        return "PASSWORD PAGE"
+    if reason.startswith("KEYWORD:"):
+        return "SOFT ERROR (keyword)"
+    if reason.startswith("ERROR:"):
+        return "BROWSER/NETWORK ERROR"
+    return "OTHER"
+
 async def check_one(context, url: str):
-    """
-    returns dict: {url, ok, status, reason, final_url}
-    """
     page = await context.new_page()
     status = None
     final_url = url
@@ -132,7 +166,6 @@ async def check_one(context, url: str):
     ok = False
 
     try:
-        # block heavy resources for speed
         async def route_handler(route):
             if route.request.resource_type in ("image", "media", "font", "stylesheet"):
                 await route.abort()
@@ -192,7 +225,7 @@ async def run_checks_async(domains, state):
         await context.close()
         await browser.close()
 
-    # update state from this round
+    # update state
     for r in results_all:
         url = r["url"]
         ok = r["ok"]
@@ -229,6 +262,7 @@ def build_check_log(results, state):
     checked = len(results)
     up = fail_tmp = down = 0
 
+    non_up = []
     for r in results:
         st = state.get(r["url"], {})
         cls = classify_state(st)
@@ -238,109 +272,134 @@ def build_check_log(results, state):
             down += 1
         else:
             fail_tmp += 1
+        if cls != "UP":
+            non_up.append((cls, r["url"], st.get("fail_count"), st.get("last_status"), st.get("last_reason")))
 
     print(
         f"[CHECK] {now_iso_utc()} | checked={checked} | "
         f"UP={up} | FAIL_TMP={fail_tmp} | DOWN_CONFIRMED={down} | "
-        f"conc={CONCURRENCY} | state_saved"
+        f"timeout_ms={TIMEOUT_MS} | conc={CONCURRENCY} | state_saved"
     )
 
-    # sample non-UP for debugging
-    samples = []
-    for r in results:
-        st = state.get(r["url"], {})
-        cls = classify_state(st)
-        if cls != "UP":
-            samples.append((cls, r["url"], st.get("fail_count"), st.get("last_status"), st.get("last_reason")))
-
-    samples.sort(key=lambda x: (0 if x[0] == "DOWN" else 1, -(int(x[2]) if x[2] else 0)))
-
-    if samples:
+    non_up.sort(key=lambda x: (0 if x[0] == "DOWN" else 1, -(int(x[2]) if x[2] else 0)))
+    if non_up:
         print(f"Non-UP sample (max {LOG_SAMPLE_LIMIT}):")
-        for (cls, url, fc, status, reason) in samples[:LOG_SAMPLE_LIMIT]:
-            print(f" - {cls} | fail={fc} | status={status} | {reason} | {url}")
+        for (cls, url, fc, status, reason) in non_up[:LOG_SAMPLE_LIMIT]:
+            print(f" - {cls} | fail={fc} | status={status} | {short_reason(reason)} | {url}")
 
-def build_instant_summary(results, state):
+def format_group_section(title, items, limit):
+    """
+    items: list of tuples (fail_count, status, reason, url)
+    """
+    if not items:
+        return []
+    lines = [f"\n{title} ({len(items)}):"]
+    for (fc, status, reason, url) in items[:limit]:
+        status_txt = str(status) if status is not None else "-"
+        lines.append(f"• ({fc}) [{status_txt}] {short_reason(reason)} — {url}")
+    if len(items) > limit:
+        lines.append(f"… +{len(items) - limit} more")
+    return lines
+
+def build_pretty_summary(title_prefix, results, state):
     checked = len(results)
     up = fail_tmp = down = 0
-    down_list = []
-    fail_tmp_list = []
+
+    # Collect non-up items grouped by reason type
+    groups = {}
 
     for r in results:
-        st = state.get(r["url"], {})
+        url = r["url"]
+        st = state.get(url, {})
         cls = classify_state(st)
+
         if cls == "UP":
             up += 1
+            continue
         elif cls == "DOWN":
             down += 1
-            down_list.append((r["url"], st))
         else:
             fail_tmp += 1
-            fail_tmp_list.append((r["url"], st))
 
-    msg = []
-    msg.append(f"🧪 Test Run Result (UTC): {now_iso_utc()}")
-    msg.append(f"checked={checked} | ✅UP={up} | ⚠️FAIL_TMP={fail_tmp} | ❌DOWN={down}")
-    msg.append(f"Rule: DOWN if fail_count ≥ {FAIL_THRESHOLD}")
+        fc = int(st.get("fail_count", 0))
+        status = st.get("last_status")
+        reason = st.get("last_reason")
 
-    if down_list:
-        msg.append("\n❌ DOWN (confirmed):")
-        down_list.sort(key=lambda x: int(x[1].get("fail_count", 0)), reverse=True)
-        for (url, st) in down_list[:min(50, MAX_REPORT_ITEMS)]:
-            msg.append(f"- fail={st.get('fail_count')} | status={st.get('last_status')} | {st.get('last_reason')} | {url}")
+        g = reason_group(reason, status)
+        groups.setdefault(g, []).append((fc, status, reason, url))
 
-    if fail_tmp_list:
-        msg.append("\n⚠️ FAIL_TMP (not confirmed yet):")
-        fail_tmp_list.sort(key=lambda x: int(x[1].get("fail_count", 0)), reverse=True)
-        for (url, st) in fail_tmp_list[:30]:
-            msg.append(f"- fail={st.get('fail_count')} | status={st.get('last_status')} | {st.get('last_reason')} | {url}")
+    # Sort inside each group by fail_count desc then status
+    for g in groups:
+        groups[g].sort(key=lambda x: (-x[0], (999 if x[1] is None else x[1])))
 
-    return "\n".join(msg)
+    # Overall ordering: most critical first
+    group_order = [
+        "DNS / DOMAIN NOT FOUND",
+        "TIMEOUT (30s)",
+        "HTTP 5xx",
+        "CONNECTION ERROR",
+        "HTTP 404",
+        "PASSWORD PAGE",
+        "SOFT ERROR (keyword)",
+        "BROWSER/NETWORK ERROR",
+        "OTHER",
+    ]
+
+    lines = []
+    lines.append(f"{title_prefix} (UTC): {now_iso_utc()}")
+    lines.append(f"📌 Checked: {checked} | ✅ UP: {up} | ⚠️ FAIL_TMP: {fail_tmp} | ❌ DOWN: {down}")
+    lines.append(f"⚙️ Rule: DOWN if fail_count ≥ {FAIL_THRESHOLD} | Timeout: {TIMEOUT_MS//1000}s | Concurrency: {CONCURRENCY}")
+
+    # If nothing wrong
+    if not groups:
+        lines.append("\n✅ All domains look OK.")
+        return "\n".join(lines)
+
+    # Decide per-group limit to keep message readable
+    per_group_limit = 25 if checked <= 200 else 15
+
+    # Put DOWN first section if any
+    # We rebuild a "confirmed down" list regardless of group
+    down_items = []
+    for r in results:
+        url = r["url"]
+        st = state.get(url, {})
+        if classify_state(st) == "DOWN":
+            down_items.append((int(st.get("fail_count", 0)), st.get("last_status"), st.get("last_reason"), url))
+    down_items.sort(key=lambda x: (-x[0], (999 if x[1] is None else x[1])))
+
+    if down_items:
+        lines += format_group_section("❌ DOWN (confirmed)", down_items, min(MAX_REPORT_ITEMS, 60))
+
+    # FAIL_TMP groups
+    for g in group_order:
+        items = groups.get(g, [])
+        # Only show FAIL_TMP here; skip items that are confirmed down if already shown above
+        filtered = [it for it in items if it[0] < FAIL_THRESHOLD]
+        if not filtered:
+            continue
+        lines += format_group_section(f"⚠️ FAIL_TMP — {g}", filtered, per_group_limit)
+
+    return "\n".join(lines)
 
 def report_and_reset(state):
     total = len(state)
-    up = fail_tmp = down = 0
-    down_list = []
-    fail_tmp_list = []
-
+    # build report from state (not from results)
+    # We convert state into a pseudo-results list to reuse formatter
+    pseudo_results = []
     for url, st in state.items():
-        cls = classify_state(st)
-        if cls == "UP":
-            up += 1
-        elif cls == "DOWN":
-            down += 1
-            down_list.append((url, st))
-        else:
-            fail_tmp += 1
-            fail_tmp_list.append((url, st))
+        pseudo_results.append({
+            "url": url,
+            "ok": (int(st.get("fail_count", 0)) == 0),
+            "status": st.get("last_status"),
+            "reason": st.get("last_reason"),
+            "final_url": st.get("final_url", url),
+        })
 
-    msg = []
-    msg.append(f"🧾 Night Monitor Summary (UTC): {now_iso_utc()}")
-    msg.append(f"Total: {total} | ✅ UP: {up} | ⚠️ FAIL_TMP: {fail_tmp} | ❌ DOWN: {down}")
-    msg.append(f"Rule: DOWN if fail_count ≥ {FAIL_THRESHOLD}")
-
-    if down_list:
-        msg.append("\n❌ DOWN (confirmed):")
-        down_list.sort(key=lambda x: int(x[1].get("fail_count", 0)), reverse=True)
-        for (url, st) in down_list[:MAX_REPORT_ITEMS]:
-            msg.append(
-                f"- fail={st.get('fail_count')} | status={st.get('last_status')} | {st.get('last_reason')} | last_ok={st.get('last_ok')} | {url}"
-            )
-        if len(down_list) > MAX_REPORT_ITEMS:
-            msg.append(f"... and {len(down_list)-MAX_REPORT_ITEMS} more")
-
-    if fail_tmp_list:
-        msg.append("\n⚠️ FAIL_TMP (not confirmed yet):")
-        fail_tmp_list.sort(key=lambda x: int(x[1].get("fail_count", 0)), reverse=True)
-        for (url, st) in fail_tmp_list[:30]:
-            msg.append(f"- fail={st.get('fail_count')} | status={st.get('last_status')} | {st.get('last_reason')} | {url}")
-
-    text = "\n".join(msg)
+    text = build_pretty_summary("🧾 Night Monitor Summary", pseudo_results, state)
     print(text)
     send_telegram(text)
-
-    # reset for next night
-    return {}
+    return {}  # reset
 
 def main():
     if MODE == "check":
@@ -353,7 +412,7 @@ def main():
 
         # ✅ Manual test run => send immediately
         if FORCE_SEND:
-            text = build_instant_summary(results, state)
+            text = build_pretty_summary("🧪 Test Run Result", results, state)
             print("\n[SEND_NOW] Manual test run => sending Telegram summary...")
             send_telegram(text)
 
