@@ -2,19 +2,18 @@ name: Night Shop Monitor (VN 21:00-08:00)
 
 on:
   schedule:
-    # 21:00-06:00 VN tương ứng 14:00-23:00 UTC (mỗi giờ)
-    - cron: "0 14-23 * * *"
-    # 07:00-08:00 VN tương ứng 00:00-01:00 UTC (mỗi giờ)
-    - cron: "0 0-1 * * *"
+    - cron: "0 14-23 * * *"  # 21:00-06:00 VN (UTC 14-23)
+    - cron: "0 0-1 * * *"    # 07:00-08:00 VN (UTC 00-01)
   workflow_dispatch: {}
 
-permissions:
-  contents: write
+concurrency:
+  group: shop-monitor
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -31,6 +30,29 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # Cache state.json to persist fail_count across hourly runs
+      - name: Restore state cache
+        id: cache_state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: shop-monitor-state-v1
+          restore-keys: shop-monitor-state-v1
+
+      - name: Ensure state.json exists
+        run: |
+          if [ ! -f state.json ]; then echo "{}" > state.json; fi
+          echo "state.json:"
+          head -n 20 state.json || true
+
+      - name: Debug domains.txt
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          echo "---- domains.txt (first 80 lines) ----"
+          sed -n '1,80p' domains.txt || true
+          echo "--------------------------------------"
+
       - name: Decide mode (report at 01:00 UTC = 08:00 VN)
         id: mode
         run: |
@@ -40,6 +62,7 @@ jobs:
           else
             echo "MODE=check" >> $GITHUB_OUTPUT
           fi
+          echo "UTC hour=$HOUR, MODE=${{ steps.mode.outputs.MODE }}"
 
       - name: Run monitor
         env:
@@ -49,19 +72,10 @@ jobs:
           CHECK_PATH: /
           TIMEOUT_MS: "12000"
           FAIL_THRESHOLD: "3"
+          MAX_REPORT_ITEMS: "80"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python monitor.py
 
-      - name: Commit updated state.json
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "Update monitor state"
-          git push
+      # NOTE: No git commit/push. Cache will be saved automatically when state.json changes.
